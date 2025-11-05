@@ -6,6 +6,7 @@ import com.sun.source.tree.ExpressionTree;
 import com.sun.source.tree.LiteralTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.TypeCastTree;
+import com.sun.source.tree.UnaryTree;
 import com.sun.source.tree.VariableTree;
 import com.sun.source.util.TreePath;
 import java.io.Serializable;
@@ -16,6 +17,7 @@ import javax.lang.model.element.Element;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import org.checkerframework.checker.signedness.qual.BitPattern;
 import org.checkerframework.checker.signedness.qual.PolySigned;
 import org.checkerframework.checker.signedness.qual.Signed;
 import org.checkerframework.checker.signedness.qual.SignedPositive;
@@ -75,6 +77,10 @@ public class SignednessAnnotatedTypeFactory extends BaseAnnotatedTypeFactory {
   /** The @PolySigned annotation. */
   protected final AnnotationMirror POLY_SIGNED =
       AnnotationBuilder.fromClass(elements, PolySigned.class);
+
+  /** The @BitPattern annotation. */
+  private final AnnotationMirror BIT_PATTERN =
+      AnnotationBuilder.fromClass(elements, BitPattern.class);
 
   /** The @NonNegative annotation of the Index Checker, as represented by the Value Checker. */
   private final AnnotationMirror INT_RANGE_FROM_NON_NEGATIVE =
@@ -261,6 +267,8 @@ public class SignednessAnnotatedTypeFactory extends BaseAnnotatedTypeFactory {
 
   @Override
   protected TreeAnnotator createTreeAnnotator() {
+    // Put SignednessTreeAnnotator first so it can set @BitPattern before PropagationTreeAnnotator
+    // computes LUB, then PropagationTreeAnnotator will see the annotation and skip processing
     return new ListTreeAnnotator(new SignednessTreeAnnotator(this), super.createTreeAnnotator());
   }
 
@@ -292,24 +300,63 @@ public class SignednessAnnotatedTypeFactory extends BaseAnnotatedTypeFactory {
 
     @Override
     public Void visitBinary(BinaryTree tree, AnnotatedTypeMirror type) {
+      // Run our logic first to set @BitPattern before PropagationTreeAnnotator computes LUB
       switch (tree.getKind()) {
+        case AND:
+        case OR:
+        case XOR:
+          // Bitwise operations preserve @BitPattern if either operand has it
+          // Get types directly from operands (before widening) to preserve @BitPattern
+          AnnotatedTypeMirror leftType = getAnnotatedType(tree.getLeftOperand());
+          AnnotatedTypeMirror rightType = getAnnotatedType(tree.getRightOperand());
+          // Check if either operand has @BitPattern (check effective annotations to catch
+          // cases where @BitPattern might be in the type through other means)
+          boolean leftHasBitPattern =
+              leftType.hasPrimaryAnnotation(BitPattern.class)
+                  || AnnotationUtils.containsSame(leftType.getEffectiveAnnotations(), BIT_PATTERN);
+          boolean rightHasBitPattern =
+              rightType.hasPrimaryAnnotation(BitPattern.class)
+                  || AnnotationUtils.containsSame(rightType.getEffectiveAnnotations(), BIT_PATTERN);
+          if (leftHasBitPattern || rightHasBitPattern) {
+            // Override any annotation set by PropagationTreeAnnotator
+            type.replaceAnnotation(BIT_PATTERN);
+          }
+          break;
         case LEFT_SHIFT:
         case RIGHT_SHIFT:
         case UNSIGNED_RIGHT_SHIFT:
           TreePath path = getPath(tree);
-          if (path != null
+          AnnotatedTypeMirror lht = getAnnotatedType(tree.getLeftOperand());
+          // Check for @BitPattern annotation
+          boolean lhtHasBitPattern = lht.hasPrimaryAnnotation(BitPattern.class);
+          if (lhtHasBitPattern) {
+            // Shifts preserve @BitPattern - override PropagationTreeAnnotator's result
+            type.replaceAnnotation(BIT_PATTERN);
+          } else if (path != null
               && (SignednessShifts.isMaskedShiftEitherSignedness(tree, path)
                   || SignednessShifts.isCastedShiftEitherSignedness(tree, path))) {
             type.replaceAnnotation(SIGNED_POSITIVE);
-          } else {
-            AnnotatedTypeMirror lht = getAnnotatedType(tree.getLeftOperand());
-            type.replaceAnnotations(lht.getPrimaryAnnotations());
           }
           break;
         default:
           // Do nothing
       }
-      return null;
+      // Let PropagationTreeAnnotator handle other cases (via super)
+      return super.visitBinary(tree, type);
+    }
+
+    @Override
+    public Void visitUnary(UnaryTree tree, AnnotatedTypeMirror type) {
+      if (tree.getKind() == Tree.Kind.BITWISE_COMPLEMENT) {
+        // Bitwise complement preserves @BitPattern
+        AnnotatedTypeMirror exprType = getAnnotatedType(tree.getExpression());
+        boolean exprHasBitPattern = exprType.hasPrimaryAnnotation(BitPattern.class);
+        if (exprHasBitPattern) {
+          type.replaceAnnotation(BIT_PATTERN);
+          return null; // Return early so PropagationTreeAnnotator sees the annotation
+        }
+      }
+      return super.visitUnary(tree, type);
     }
 
     @Override
